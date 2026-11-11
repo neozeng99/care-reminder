@@ -5,17 +5,19 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.os.Build
+import com.care.reminder.MainActivity
 import com.care.reminder.data.ReminderRepository
 import com.care.reminder.model.ReminderItem
 import com.care.reminder.model.ScheduleType
 import java.util.Calendar
 
 /**
- * 精确闹钟调度器
- * 支持：
- * 1. 每天定点提醒（如 08:00 吃药）
- * 2. 间隔循环提醒（如每 60 分钟喝水、每 45 分钟久坐活动，自动避开夜间免打扰时段）
- * 3. 延后 10 分钟（Snooze）再次响铃
+ * 针对小米澎湃OS 2 / MIUI 深度加固的精确闹钟调度器
+ *
+ * 核心加固策略：
+ * 1. 优先采用 `AlarmManager.setAlarmClock()`（闹钟级最高优先级，不受 Doze 与普通精确闹钟频率限制，状态栏显示小闹钟图标保障）。
+ * 2. 每次完成调度后，将 `nextTriggerAtMillis` 持久化写入本地存储。
+ * 3. 提供 `verifyAndHealAll()`：App 每次冷启动或回到主界面时自动比对持久化的下次触发时间，若已过期或丢失则立即自愈补调度。
  */
 object ReminderScheduler {
 
@@ -35,25 +37,30 @@ object ReminderScheduler {
     }
 
     /**
-     * 为单条提醒注册下一次闹钟
+     * 为单条提醒注册下一次闹钟，并将下次触发时间持久化到本地
      */
     fun scheduleReminder(context: Context, item: ReminderItem, nowMillis: Long = System.currentTimeMillis()): Long? {
-        cancelReminder(context, item.id)
-        if (!item.enabled) return null
+        val repo = ReminderRepository(context)
+        cancelReminder(context, item.id, clearPersisted = false)
+        if (!item.enabled) {
+            repo.updateNextTriggerMillis(item.id, nextTriggerAtMillis = 0L, snoozeUntilMillis = 0L)
+            return null
+        }
 
         val triggerAtMillis = computeNextTriggerMillis(item, nowMillis)
-        setExactAlarm(
+        setAlarmClockFirst(
             context = context,
             reminderId = item.id,
             triggerAtMillis = triggerAtMillis,
             isSnooze = false,
             requestCode = requestCodeFor(item.id, isSnooze = false)
         )
+        repo.updateNextTriggerMillis(item.id, nextTriggerAtMillis = triggerAtMillis)
         return triggerAtMillis
     }
 
     /**
-     * 延后 N 分钟提醒（默认 10 分钟）
+     * 延后 N 分钟提醒（默认 10 分钟），并持久化延后触发时间
      */
     fun scheduleSnooze(
         context: Context,
@@ -65,7 +72,7 @@ object ReminderScheduler {
         val repo = ReminderRepository(context)
         repo.updateSnoozeUntil(item.id, triggerAtMillis)
 
-        setExactAlarm(
+        setAlarmClockFirst(
             context = context,
             reminderId = item.id,
             triggerAtMillis = triggerAtMillis,
@@ -76,9 +83,28 @@ object ReminderScheduler {
     }
 
     /**
+     * 5 秒后触发一次真实系统闹钟测试（用于检验小米澎湃OS锁屏后台弹窗与通知权限是否被拦截）
+     */
+    fun scheduleQuickTestAlarm(
+        context: Context,
+        item: ReminderItem,
+        delaySeconds: Int = 5
+    ): Long {
+        val triggerAtMillis = System.currentTimeMillis() + delaySeconds * 1000L
+        setAlarmClockFirst(
+            context = context,
+            reminderId = item.id,
+            triggerAtMillis = triggerAtMillis,
+            isSnooze = true,
+            requestCode = requestCodeFor(item.id, isSnooze = true) + 7
+        )
+        return triggerAtMillis
+    }
+
+    /**
      * 取消某条提醒的常规闹钟与延后闹钟
      */
-    fun cancelReminder(context: Context, reminderId: String) {
+    fun cancelReminder(context: Context, reminderId: String, clearPersisted: Boolean = true) {
         val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
         listOf(false, true).forEach { isSnooze ->
             val pendingIntent = buildPendingIntent(
@@ -89,30 +115,75 @@ object ReminderScheduler {
             )
             alarmManager.cancel(pendingIntent)
         }
+        if (clearPersisted) {
+            ReminderRepository(context).updateNextTriggerMillis(
+                reminderId = reminderId,
+                nextTriggerAtMillis = 0L,
+                snoozeUntilMillis = 0L
+            )
+        }
     }
 
     /**
-     * 重新注册所有已开启的提醒（应用启动或手机重启后调用）
+     * 冷启动 / 回到主界面时的自愈巡检：
+     * 检查每条启用提醒持久化的 `nextTriggerAtMillis` 是否已过期、未初始化或被系统打断，
+     * 如有过期则立即重新注册 `setAlarmClock()` 并返回本次自愈修复的条数。
      */
-    fun rescheduleAll(context: Context) {
+    fun verifyAndHealAll(context: Context): Int {
         val repo = ReminderRepository(context)
         val now = System.currentTimeMillis()
+        var healedCount = 0
+
         repo.getReminders().forEach { item ->
-            if (item.enabled) {
-                scheduleReminder(context, item, now)
-                if (item.snoozeUntilMillis > now) {
-                    setExactAlarm(
-                        context = context,
-                        reminderId = item.id,
-                        triggerAtMillis = item.snoozeUntilMillis,
-                        isSnooze = true,
-                        requestCode = requestCodeFor(item.id, isSnooze = true)
-                    )
+            if (!item.enabled) {
+                if (item.nextTriggerAtMillis != 0L) {
+                    cancelReminder(context, item.id, clearPersisted = true)
                 }
-            } else {
-                cancelReminder(context, item.id)
+                return@forEach
+            }
+
+            // 1. 检查常规闹钟持久化的下次触发时间是否已过期或未设置
+            val expectedNext = computeNextTriggerMillis(item, now)
+            val persisted = item.nextTriggerAtMillis
+            val needsHeal = persisted <= now || kotlin.math.abs(persisted - expectedNext) > 60_000L
+
+            if (needsHeal) {
+                healedCount++
+            }
+            // 无论是否过期，都在回前台时刷新一次 setAlarmClock 确保系统闹钟队列中存在
+            setAlarmClockFirst(
+                context = context,
+                reminderId = item.id,
+                triggerAtMillis = expectedNext,
+                isSnooze = false,
+                requestCode = requestCodeFor(item.id, isSnooze = false)
+            )
+            val validSnooze = if (item.snoozeUntilMillis > now) item.snoozeUntilMillis else 0L
+            repo.updateNextTriggerMillis(
+                reminderId = item.id,
+                nextTriggerAtMillis = expectedNext,
+                snoozeUntilMillis = validSnooze
+            )
+
+            // 2. 如果存在未过期的 10 分钟延后闹钟，同步恢复
+            if (validSnooze > now) {
+                setAlarmClockFirst(
+                    context = context,
+                    reminderId = item.id,
+                    triggerAtMillis = validSnooze,
+                    isSnooze = true,
+                    requestCode = requestCodeFor(item.id, isSnooze = true)
+                )
             }
         }
+        return healedCount
+    }
+
+    /**
+     * 重新注册所有已开启的提醒（手机重启广播或应用升级广播调用）
+     */
+    fun rescheduleAll(context: Context) {
+        verifyAndHealAll(context)
     }
 
     /**
@@ -176,7 +247,11 @@ object ReminderScheduler {
         return candidate.timeInMillis
     }
 
-    private fun setExactAlarm(
+    /**
+     * 核心：优先使用 `setAlarmClock()`，在小米 HyperOS / MIUI 中享受系统级闹钟白名单待遇，
+     * 并在状态栏显示闹钟图标；若权限异常则逐级回退至 `setExactAndAllowWhileIdle`。
+     */
+    private fun setAlarmClockFirst(
         context: Context,
         reminderId: String,
         triggerAtMillis: Long,
@@ -184,28 +259,44 @@ object ReminderScheduler {
         requestCode: Int
     ) {
         val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
-        val pendingIntent = buildPendingIntent(context, reminderId, isSnooze, requestCode)
+        val operationIntent = buildPendingIntent(context, reminderId, isSnooze, requestCode)
+
+        // 点击状态栏闹钟图标时打开主界面
+        val showMainIntent = Intent(context, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        val showPendingIntent = PendingIntent.getActivity(
+            context,
+            requestCode + 500_000,
+            showMainIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
 
         try {
             if (canScheduleExactAlarms(context)) {
-                alarmManager.setExactAndAllowWhileIdle(
-                    AlarmManager.RTC_WAKEUP,
-                    triggerAtMillis,
-                    pendingIntent
-                )
+                val alarmClockInfo = AlarmManager.AlarmClockInfo(triggerAtMillis, showPendingIntent)
+                alarmManager.setAlarmClock(alarmClockInfo, operationIntent)
             } else {
                 alarmManager.setAndAllowWhileIdle(
                     AlarmManager.RTC_WAKEUP,
                     triggerAtMillis,
-                    pendingIntent
+                    operationIntent
                 )
             }
         } catch (_: SecurityException) {
-            alarmManager.setAndAllowWhileIdle(
-                AlarmManager.RTC_WAKEUP,
-                triggerAtMillis,
-                pendingIntent
-            )
+            try {
+                alarmManager.setExactAndAllowWhileIdle(
+                    AlarmManager.RTC_WAKEUP,
+                    triggerAtMillis,
+                    operationIntent
+                )
+            } catch (_: SecurityException) {
+                alarmManager.setAndAllowWhileIdle(
+                    AlarmManager.RTC_WAKEUP,
+                    triggerAtMillis,
+                    operationIntent
+                )
+            }
         }
     }
 

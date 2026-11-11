@@ -63,7 +63,8 @@ data class ReminderItem(
     val activeEndHour: Int = 21,            // 间隔提醒生效结束小时（默认晚 9 点，夜间免打扰）
     val enabled: Boolean = true,
     val voiceEnabled: Boolean = true,
-    val snoozeUntilMillis: Long = 0L        // 若处于“延后10分钟”状态，记录下次响铃时间戳
+    val snoozeUntilMillis: Long = 0L,       // 若处于“延后10分钟”状态，记录下次响铃时间戳
+    val nextTriggerAtMillis: Long = 0L      // 持久化的下一次闹钟触发时间（用于冷启动/回前台自愈巡检）
 ) {
     /**
      * 生成适合老年人的中文语音播报内容

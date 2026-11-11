@@ -21,7 +21,9 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -30,7 +32,6 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FloatingActionButton
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
@@ -44,6 +45,7 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -62,6 +64,7 @@ import androidx.core.content.ContextCompat
 import com.care.reminder.alarm.NotificationActionReceiver
 import com.care.reminder.alarm.NotificationHelper
 import com.care.reminder.alarm.ReminderScheduler
+import com.care.reminder.alarm.XiaomiPermissionHelper
 import com.care.reminder.data.ReminderRepository
 import com.care.reminder.model.CheckInRecord
 import com.care.reminder.model.CheckInStatus
@@ -86,8 +89,11 @@ import kotlinx.coroutines.launch
 fun ReminderApp(
     hasNotificationPermission: Boolean,
     hasExactAlarmPermission: Boolean,
+    isIgnoringBatteryOptimizations: Boolean,
+    externalRefreshTick: Int,
     onRequestNotificationPermission: () -> Unit,
-    onRequestExactAlarmPermission: () -> Unit
+    onRequestExactAlarmPermission: () -> Unit,
+    onRequestIgnoreBatteryOptimizations: () -> Unit
 ) {
     val context = LocalContext.current
     val repo = remember { ReminderRepository(context) }
@@ -99,14 +105,21 @@ fun ReminderApp(
     var selectedTab by remember { mutableIntStateOf(0) }
     var selectedCategoryFilter by remember { mutableStateOf<ReminderCategory?>(null) }
 
-    // 弹窗控制：新增/编辑提醒 & 防重复吃药二次确认
+    // 弹窗控制：新增/编辑提醒、防重复吃药二次确认、小米澎湃OS保活向导
     var editingItem by remember { mutableStateOf<ReminderItem?>(null) }
     var showEditDialog by remember { mutableStateOf(false) }
     var duplicateMedicineConfirmItem by remember { mutableStateOf<ReminderItem?>(null) }
+    var showXiaomiGuideDialog by remember {
+        mutableStateOf(!isIgnoringBatteryOptimizations)
+    }
 
     fun refreshData() {
         reminders = repo.getReminders()
         todayRecords = repo.getTodayRecords()
+    }
+
+    LaunchedEffect(externalRefreshTick) {
+        refreshData()
     }
 
     // 监听来自通知栏按钮或全屏强提醒页的打卡广播，实时刷新界面
@@ -148,14 +161,35 @@ fun ReminderApp(
                     Column {
                         Text(
                             text = "安心健康提醒",
-                            fontSize = 23.sp,
+                            fontSize = 22.sp,
                             fontWeight = FontWeight.ExtraBold,
                             color = Color.White
                         )
                         Text(
-                            text = "今日（${todayDateKey()}）· 吃药防忘 · 喝水 · 久坐活动",
-                            fontSize = 14.sp,
+                            text = "今日（${todayDateKey()}）· 闹钟级保活已开启",
+                            fontSize = 13.sp,
                             color = Color(0xFFE2E8F0)
+                        )
+                    }
+                },
+                actions = {
+                    Button(
+                        onClick = { showXiaomiGuideDialog = true },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (isIgnoringBatteryOptimizations && hasNotificationPermission) {
+                                Color(0xFF0D9488)
+                            } else {
+                                SedentaryAmber
+                            }
+                        ),
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.padding(end = 8.dp)
+                    ) {
+                        Text(
+                            text = "📱 小米防漏报设置",
+                            fontSize = 15.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = Color.White
                         )
                     }
                 },
@@ -226,16 +260,29 @@ fun ReminderApp(
                     contentPadding = PaddingValues(16.dp, 16.dp, 16.dp, 96.dp),
                     verticalArrangement = Arrangement.spacedBy(14.dp)
                 ) {
-                    // 权限自检提醒条
-                    if (!hasNotificationPermission || !hasExactAlarmPermission) {
-                        item {
-                            PermissionBannerCard(
-                                hasNotificationPermission = hasNotificationPermission,
-                                hasExactAlarmPermission = hasExactAlarmPermission,
-                                onRequestNotificationPermission = onRequestNotificationPermission,
-                                onRequestExactAlarmPermission = onRequestExactAlarmPermission
-                            )
-                        }
+                    // 小米澎湃OS / 权限与测试诊断栏
+                    item {
+                        XiaomiDiagnosticBannerCard(
+                            hasNotificationPermission = hasNotificationPermission,
+                            hasExactAlarmPermission = hasExactAlarmPermission,
+                            isIgnoringBatteryOptimizations = isIgnoringBatteryOptimizations,
+                            onOpenGuide = { showXiaomiGuideDialog = true },
+                            onTestForegroundNow = {
+                                val sample = reminders.firstOrNull() ?: return@XiaomiDiagnosticBannerCard
+                                NotificationHelper.showReminderNotification(context, sample)
+                                VoiceSpeaker.speak(context, sample.buildSpeechText(false), vibrate = true)
+                                scope.launch {
+                                    snackbarHostState.showSnackbar("🔔 已发送前台测试通知并播报语音（若能看到听到，说明通知渠道与语音正常）")
+                                }
+                            },
+                            onTestLockScreen5Sec = {
+                                val sample = reminders.firstOrNull() ?: return@XiaomiDiagnosticBannerCard
+                                ReminderScheduler.scheduleQuickTestAlarm(context, sample, delaySeconds = 5)
+                                scope.launch {
+                                    snackbarHostState.showSnackbar("🔒 已预约 5 秒后闹钟！请现在立刻按手机电源键【锁屏】，等待 5 秒看是否亮屏弹窗")
+                                }
+                            }
+                        )
                     }
 
                     // 今日吃药、喝水、活动总览看板
@@ -354,6 +401,22 @@ fun ReminderApp(
         }
     }
 
+    // 小米澎湃OS 2 / MIUI 专属设置与保活向导弹窗
+    if (showXiaomiGuideDialog) {
+        XiaomiHyperOsGuideDialog(
+            hasNotificationPermission = hasNotificationPermission,
+            hasExactAlarmPermission = hasExactAlarmPermission,
+            isIgnoringBatteryOptimizations = isIgnoringBatteryOptimizations,
+            onRequestNotificationPermission = onRequestNotificationPermission,
+            onRequestExactAlarmPermission = onRequestExactAlarmPermission,
+            onRequestIgnoreBatteryOptimizations = onRequestIgnoreBatteryOptimizations,
+            onOpenPowerKeeper = { XiaomiPermissionHelper.openXiaomiPowerKeeperSettings(context) },
+            onOpenAutoStart = { XiaomiPermissionHelper.openXiaomiAutoStartSettings(context) },
+            onOpenOtherPermissions = { XiaomiPermissionHelper.openXiaomiOtherPermissionsEditor(context) },
+            onDismiss = { showXiaomiGuideDialog = false }
+        )
+    }
+
     // 新增 / 编辑弹窗
     if (showEditDialog) {
         ReminderEditDialog(
@@ -365,7 +428,7 @@ fun ReminderApp(
                 refreshData()
                 showEditDialog = false
                 scope.launch {
-                    snackbarHostState.showSnackbar("已保存提醒：${saved.title}")
+                    snackbarHostState.showSnackbar("已保存并注册系统闹钟：${saved.title}")
                 }
             },
             onDelete = { toDelete ->
@@ -430,46 +493,238 @@ fun ReminderApp(
     }
 }
 
+/**
+ * 顶部小米澎湃OS保活状态与「前台/锁屏真机双测试」面板
+ */
 @Composable
-private fun PermissionBannerCard(
+private fun XiaomiDiagnosticBannerCard(
     hasNotificationPermission: Boolean,
     hasExactAlarmPermission: Boolean,
-    onRequestNotificationPermission: () -> Unit,
-    onRequestExactAlarmPermission: () -> Unit
+    isIgnoringBatteryOptimizations: Boolean,
+    onOpenGuide: () -> Unit,
+    onTestForegroundNow: () -> Unit,
+    onTestLockScreen5Sec: () -> Unit
 ) {
+    val allCoreGranted = hasNotificationPermission && hasExactAlarmPermission && isIgnoringBatteryOptimizations
+
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(18.dp),
-        colors = CardDefaults.cardColors(containerColor = SedentaryAmberBg)
+        colors = CardDefaults.cardColors(
+            containerColor = if (allCoreGranted) Color(0xFFF0FDF4) else SedentaryAmberBg
+        )
     ) {
         Column(
             modifier = Modifier.padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = if (allCoreGranted) {
+                        "🛡️ 系统闹钟级保活已就绪（setAlarmClock）"
+                    } else {
+                        "⚠️ 小米澎湃OS 必做保活设置（防后台拦截）"
+                    },
+                    fontSize = 17.sp,
+                    fontWeight = FontWeight.ExtraBold,
+                    color = if (allCoreGranted) SafeGreen else Color(0xFF92400E),
+                    modifier = Modifier.weight(1f)
+                )
+                TextButton(onClick = onOpenGuide) {
+                    Text("设置向导 >", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                }
+            }
+
+            if (!allCoreGranted) {
+                Button(
+                    onClick = onOpenGuide,
+                    colors = ButtonDefaults.buttonColors(containerColor = SedentaryAmber),
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Text(
+                        text = "点击打开「小米澎湃OS 防漏报一键设置向导」",
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+
+            // 前台测试 vs 5秒锁屏后台测试（区分代码问题还是小米后台限制）
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                OutlinedButton(
+                    onClick = onTestForegroundNow,
+                    modifier = Modifier.weight(1f),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Text("🔔 前台测试通知", fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                }
+                OutlinedButton(
+                    onClick = onTestLockScreen5Sec,
+                    modifier = Modifier.weight(1f),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Text("🔒 5秒锁屏测试", fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                }
+            }
+        }
+    }
+}
+
+/**
+ * 小米澎湃OS 2 / MIUI 专属防拦截分步引导弹窗
+ */
+@Composable
+private fun XiaomiHyperOsGuideDialog(
+    hasNotificationPermission: Boolean,
+    hasExactAlarmPermission: Boolean,
+    isIgnoringBatteryOptimizations: Boolean,
+    onRequestNotificationPermission: () -> Unit,
+    onRequestExactAlarmPermission: () -> Unit,
+    onRequestIgnoreBatteryOptimizations: () -> Unit,
+    onOpenPowerKeeper: () -> Unit,
+    onOpenAutoStart: () -> Unit,
+    onOpenOtherPermissions: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
             Text(
-                text = "🔔 请开启关键提醒权限，确保准点响铃",
-                fontSize = 19.sp,
-                fontWeight = FontWeight.Bold,
-                color = Color(0xFF92400E)
+                text = "📱 小米澎湃OS 防漏报设置向导",
+                fontSize = 21.sp,
+                fontWeight = FontWeight.ExtraBold
             )
-            if (!hasNotificationPermission) {
-                Button(
-                    onClick = onRequestNotificationPermission,
-                    colors = ButtonDefaults.buttonColors(containerColor = SedentaryAmber),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text("点击开启「通知栏弹窗权限」", fontSize = 17.sp, fontWeight = FontWeight.Bold)
+        },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Text(
+                    text = "本应用已采用系统级闹钟（setAlarmClock）+ 下次触发时间本地持久化自愈。针对小米澎湃OS 2 的后台管控，请依次点开以下设置（只需设置一次）：",
+                    fontSize = 15.sp,
+                    color = Color(0xFF334155)
+                )
+
+                // 第 1 步：基础通知与精确闹钟权限
+                GuideStepItem(
+                    stepTitle = "第 1 步：开启通知权限",
+                    statusDone = hasNotificationPermission,
+                    desc = "允许发送提醒通知与声音震动",
+                    buttonText = if (hasNotificationPermission) "已开启（点此检查锁屏/悬浮通知）" else "点击开启通知权限",
+                    onClick = onRequestNotificationPermission
+                )
+
+                if (!hasExactAlarmPermission) {
+                    GuideStepItem(
+                        stepTitle = "补充：开启精确闹钟权限",
+                        statusDone = false,
+                        desc = "允许 setAlarmClock 准点唤醒手机",
+                        buttonText = "点击开启准点闹钟",
+                        onClick = onRequestExactAlarmPermission
+                    )
                 }
+
+                // 第 2 步：加入系统电池优化白名单
+                GuideStepItem(
+                    stepTitle = "第 2 步：加入电池优化白名单",
+                    statusDone = isIgnoringBatteryOptimizations,
+                    desc = "防止锁屏息屏后闹钟重调度被系统挂起",
+                    buttonText = if (isIgnoringBatteryOptimizations) "✓ 已加入电池白名单" else "点击一键加入白名单",
+                    onClick = onRequestIgnoreBatteryOptimizations
+                )
+
+                // 第 3 步：小米省电策略设为「无限制」
+                GuideStepItem(
+                    stepTitle = "第 3 步：澎湃OS 省电策略设为「无限制」",
+                    statusDone = false,
+                    desc = "进入后选择【无限制】，防止澎湃OS 在后台杀死进程",
+                    buttonText = "跳转小米「省电策略」设置 >",
+                    onClick = onOpenPowerKeeper
+                )
+
+                // 第 4 步：小米「自启动」与「锁屏显示/后台弹出界面」
+                GuideStepItem(
+                    stepTitle = "第 4 步：开启「自启动」（防重启失效）",
+                    statusDone = false,
+                    desc = "开启后手机关机重启也能自动恢复吃药闹钟",
+                    buttonText = "跳转小米「自启动管理」 >",
+                    onClick = onOpenAutoStart
+                )
+
+                GuideStepItem(
+                    stepTitle = "第 5 步：允许「锁屏显示」与「后台弹出界面」",
+                    statusDone = false,
+                    desc = "在权限列表中将【锁屏显示】和【后台弹出界面】设为允许，锁屏时才能直接弹出大字打卡页",
+                    buttonText = "跳转小米「权限管理」 >",
+                    onClick = onOpenOtherPermissions
+                )
             }
-            if (!hasExactAlarmPermission) {
-                Button(
-                    onClick = onRequestExactAlarmPermission,
-                    colors = ButtonDefaults.buttonColors(containerColor = SedentaryAmber),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text("点击开启「准点闹钟权限」", fontSize = 17.sp, fontWeight = FontWeight.Bold)
-                }
+        },
+        confirmButton = {
+            Button(
+                onClick = onDismiss,
+                colors = ButtonDefaults.buttonColors(containerColor = CareTeal)
+            ) {
+                Text("设置完成", fontSize = 18.sp, fontWeight = FontWeight.Bold)
             }
+        }
+    )
+}
+
+@Composable
+private fun GuideStepItem(
+    stepTitle: String,
+    statusDone: Boolean,
+    desc: String,
+    buttonText: String,
+    onClick: () -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(
+                if (statusDone) SafeGreenBg else Color(0xFFF8FAFC),
+                RoundedCornerShape(14.dp)
+            )
+            .border(
+                1.dp,
+                if (statusDone) SafeGreen else Color(0xFFCBD5E1),
+                RoundedCornerShape(14.dp)
+            )
+            .padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp)
+    ) {
+        Text(
+            text = if (statusDone) "✅ $stepTitle" else "🔸 $stepTitle",
+            fontSize = 16.sp,
+            fontWeight = FontWeight.Bold,
+            color = if (statusDone) SafeGreen else Color(0xFF0F172A)
+        )
+        Text(
+            text = desc,
+            fontSize = 14.sp,
+            color = Color(0xFF475569)
+        )
+        Button(
+            onClick = onClick,
+            colors = ButtonDefaults.buttonColors(
+                containerColor = if (statusDone) SafeGreen else CareTeal
+            ),
+            shape = RoundedCornerShape(10.dp),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text(buttonText, fontSize = 15.sp, fontWeight = FontWeight.Bold)
         }
     }
 }
@@ -653,7 +908,7 @@ private fun ReminderCard(
                 )
             }
 
-            // 第二行：大字标题与副标题（剂量/动作说明）
+            // 第二行：大字标题与副标题（剂量/动作说明）+ 持久化的下次系统闹钟时间
             Column {
                 Text(
                     text = item.title,
@@ -667,6 +922,15 @@ private fun ReminderCard(
                         text = item.subtitle,
                         fontSize = 18.sp,
                         color = Color(0xFF475569)
+                    )
+                }
+                if (item.enabled && item.nextTriggerAtMillis > 0L) {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = "⏰ 系统闹钟已锁定下次触发：${currentTimeText(item.nextTriggerAtMillis)}",
+                        fontSize = 14.sp,
+                        color = CareTeal,
+                        fontWeight = FontWeight.SemiBold
                     )
                 }
             }

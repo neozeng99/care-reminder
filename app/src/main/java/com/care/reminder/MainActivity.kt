@@ -11,11 +11,13 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.core.content.ContextCompat
 import com.care.reminder.alarm.NotificationHelper
 import com.care.reminder.alarm.ReminderScheduler
+import com.care.reminder.alarm.XiaomiPermissionHelper
 import com.care.reminder.ui.ReminderApp
 import com.care.reminder.ui.theme.CareReminderTheme
 
@@ -23,18 +25,22 @@ class MainActivity : ComponentActivity() {
 
     private var hasNotificationPermission by mutableStateOf(true)
     private var hasExactAlarmPermission by mutableStateOf(true)
+    private var isIgnoringBatteryOptimizations by mutableStateOf(true)
+    private var refreshTick by mutableIntStateOf(0)
 
     private val notificationPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
             hasNotificationPermission = granted
+            refreshTick++
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // 初始化高优通知渠道与所有启用中的闹钟
+        // 1. 建立高优通知渠道
         NotificationHelper.ensureChannel(this)
-        ReminderScheduler.rescheduleAll(this)
+        // 2. 冷启动自愈巡检：检查持久化的下次触发时间，若被系统打断或过期则立即重注册 setAlarmClock
+        ReminderScheduler.verifyAndHealAll(this)
         refreshPermissionStates()
 
         // 首次进入主动请求 Android 13+ 通知权限
@@ -47,13 +53,20 @@ class MainActivity : ComponentActivity() {
                 ReminderApp(
                     hasNotificationPermission = hasNotificationPermission,
                     hasExactAlarmPermission = hasExactAlarmPermission,
+                    isIgnoringBatteryOptimizations = isIgnoringBatteryOptimizations,
+                    externalRefreshTick = refreshTick,
                     onRequestNotificationPermission = {
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                             notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                        } else {
+                            XiaomiPermissionHelper.openNotificationSettings(this)
                         }
                     },
                     onRequestExactAlarmPermission = {
                         openExactAlarmSettings()
+                    },
+                    onRequestIgnoreBatteryOptimizations = {
+                        XiaomiPermissionHelper.requestIgnoreBatteryOptimizations(this)
                     }
                 )
             }
@@ -62,7 +75,10 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        // 每次用户打开/切回主界面时执行一次持久化闹钟自愈巡检
+        ReminderScheduler.verifyAndHealAll(this)
         refreshPermissionStates()
+        refreshTick++
     }
 
     private fun refreshPermissionStates() {
@@ -75,6 +91,7 @@ class MainActivity : ComponentActivity() {
             true
         }
         hasExactAlarmPermission = ReminderScheduler.canScheduleExactAlarms(this)
+        isIgnoringBatteryOptimizations = XiaomiPermissionHelper.isIgnoringBatteryOptimizations(this)
     }
 
     private fun openExactAlarmSettings() {
@@ -85,10 +102,7 @@ class MainActivity : ComponentActivity() {
                 }
                 startActivity(intent)
             } catch (_: Exception) {
-                val fallback = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
-                    data = Uri.parse("package:$packageName")
-                }
-                startActivity(fallback)
+                XiaomiPermissionHelper.openAppDetailsSettings(this)
             }
         }
     }

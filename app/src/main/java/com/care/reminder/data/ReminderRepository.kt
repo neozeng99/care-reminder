@@ -84,6 +84,28 @@ class ReminderRepository(context: Context) {
     }
 
     /**
+     * 持久化保存某条提醒的下一次触发时间戳（供澎湃OS/MIUI进程被杀后冷启动自愈检查）
+     */
+    fun updateNextTriggerMillis(
+        reminderId: String,
+        nextTriggerAtMillis: Long,
+        snoozeUntilMillis: Long? = null
+    ): List<ReminderItem> {
+        val current = getReminders().map { item ->
+            if (item.id == reminderId) {
+                item.copy(
+                    nextTriggerAtMillis = nextTriggerAtMillis,
+                    snoozeUntilMillis = snoozeUntilMillis ?: item.snoozeUntilMillis
+                )
+            } else {
+                item
+            }
+        }
+        saveReminders(current)
+        return current
+    }
+
+    /**
      * 获取打卡历史记录（自动保留最近 14 天记录，避免无限膨胀）
      */
     fun getCheckInRecords(): List<CheckInRecord> {
@@ -170,6 +192,7 @@ class ReminderRepository(context: Context) {
             put("enabled", item.enabled)
             put("voiceEnabled", item.voiceEnabled)
             put("snoozeUntilMillis", item.snoozeUntilMillis)
+            put("nextTriggerAtMillis", item.nextTriggerAtMillis)
         }
     }
 
@@ -188,7 +211,8 @@ class ReminderRepository(context: Context) {
             activeEndHour = obj.optInt("activeEndHour", 21),
             enabled = obj.optBoolean("enabled", true),
             voiceEnabled = obj.optBoolean("voiceEnabled", true),
-            snoozeUntilMillis = obj.optLong("snoozeUntilMillis", 0L)
+            snoozeUntilMillis = obj.optLong("snoozeUntilMillis", 0L),
+            nextTriggerAtMillis = obj.optLong("nextTriggerAtMillis", 0L)
         )
     }
 
